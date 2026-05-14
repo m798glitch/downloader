@@ -59,7 +59,6 @@ jobs:
         id: parse
         run: |
           INPUT="${{ github.event.inputs.url }}"
-          # Split by commas or newlines
           MODIFIED=$(echo "$INPUT" | tr ',' '\n')
           ENTRIES='[]'
           while IFS= read -r line; do
@@ -89,12 +88,111 @@ jobs:
           done <<< "$MODIFIED"
           echo "ENTRIES_JSON=$(echo "$ENTRIES" | jq -c .)" >> $GITHUB_OUTPUT
 
+      - name: Create download script
+        run: |
+          cat > download.py << 'SCRIPT'
+import os, sys, time, json, requests, re
+
+def main():
+    entries_json = os.environ.get('ENTRIES_JSON')
+    output_folder = os.environ.get('OUTPUT_FOLDER', 'youtube')
+    global_type = os.environ.get('GLOBAL_TYPE', 'v')
+    global_val = os.environ.get('GLOBAL_VAL', '720p')
+
+    entries = json.loads(entries_json)
+    os.makedirs(output_folder, exist_ok=True)
+
+    for entry in entries:
+        url = entry['link']
+        args = entry.get('args', [])
+        type_ = global_type
+        val = global_val
+        if args:
+            if args[0] in ('v', 'a'):
+                type_ = args[0]
+                if len(args) > 1:
+                    val = args[1]
+
+        print(f"Processing: {url} ({type_} {val})")
+
+        is_audio = (type_ == 'a')
+        quality = val
+
+        # Normalize quality
+        if is_audio:
+            if quality not in ('64kbps','128kbps','192kbps','320kbps'):
+                quality = '192kbps'
+        else:
+            if quality not in ('360p','480p','720p','1080p','1440p','2160p'):
+                quality = '720p'
+
+        payload = {
+            "url": url,
+            "os": "linux",
+            "output": {
+                "type": "audio" if is_audio else "video",
+                "format": "mp3" if is_audio else "mp4"
+            }
+        }
+        if is_audio:
+            payload["audio"] = {"bitrate": quality}
+        else:
+            payload["output"]["quality"] = quality
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+            "Accept": "application/json",
+            "Origin": "https://loader.to",
+            "Referer": "https://loader.to/"
+        }
+
+        s = requests.Session()
+        s.headers.update(headers)
+        s.get("https://loader.to/", timeout=15)
+
+        resp = s.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        status_url = data.get('statusUrl')
+        title = data.get('title', 'video')
+
+        dl_url = None
+        for _ in range(120):
+            time.sleep(2)
+            try:
+                r = s.get(status_url, timeout=20)
+                status = r.json()
+                if status.get('status') == 'completed':
+                    dl_url = status.get('downloadUrl')
+                    break
+                if status.get('status') == 'failed':
+                    sys.exit(1)
+            except:
+                continue
+
+        if not dl_url:
+            sys.exit(1)
+
+        vid_match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', url)
+        vid = vid_match.group(1) if vid_match else "video"
+        safe_title = re.sub(r'[^a-zA-Z0-9_-]', '_', title)[:70]
+        filename = f"{safe_title}_{vid}_{quality}.{'mp3' if is_audio else 'mp4'}"
+        filepath = os.path.join(output_folder, filename)
+
+        r = requests.get(dl_url, stream=True)
+        with open(filepath, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        print(f"Downloaded: {filename}")
+
+if __name__ == "__main__":
+    main()
+SCRIPT
+
       - name: Download with loader.to
         run: |
-          ENTRIES_JSON='${{ steps.parse.outputs.ENTRIES_JSON }}'
           OUTPUT_FOLDER="youtube"
-          mkdir -p "$OUTPUT_FOLDER"
-
           GLOBAL_FORMAT="${{ github.event.inputs.output_format }}"
           GLOBAL_VQ="${{ github.event.inputs.video_quality }}"
           GLOBAL_AQ="${{ github.event.inputs.audio_quality }}"
@@ -107,104 +205,12 @@ jobs:
             GLOBAL_VAL="$GLOBAL_VQ"
           fi
 
-          count=$(echo "$ENTRIES_JSON" | jq length)
-          for ((idx=0; idx<count; idx++)); do
-            link=$(echo "$ENTRIES_JSON" | jq -r ".[$idx].link")
-            args=$(echo "$ENTRIES_JSON" | jq -r ".[$idx].args[]" 2>/dev/null || true)
-            type="$GLOBAL_TYPE"
-            val="$GLOBAL_VAL"
-            if [ -n "$args" ]; then
-              first=$(echo "$args" | head -1)
-              if [ "$first" = "v" ] || [ "$first" = "a" ]; then
-                type="$first"
-                val=$(echo "$args" | head -2 | tail -1)
-              fi
-            fi
+          export ENTRIES_JSON='${{ steps.parse.outputs.ENTRIES_JSON }}'
+          export OUTPUT_FOLDER="$OUTPUT_FOLDER"
+          export GLOBAL_TYPE="$GLOBAL_TYPE"
+          export GLOBAL_VAL="$GLOBAL_VAL"
 
-            echo "Processing: $link ($type $val)"
-
-            python3 << EOF
-import os, sys, time, json, requests, re
-
-url = "$link"
-is_audio = "$type" == "a"
-quality = "$val"
-
-# Normalize quality
-if is_audio:
-    if quality not in ('64kbps','128kbps','192kbps','320kbps'):
-        quality = '192kbps'
-else:
-    if quality not in ('360p','480p','720p','1080p','1440p','2160p'):
-        quality = '720p'
-
-payload = {
-    "url": url,
-    "os": "linux",
-    "output": {
-        "type": "audio" if is_audio else "video",
-        "format": "mp3" if is_audio else "mp4"
-    }
-}
-if is_audio:
-    payload["audio"] = {"bitrate": quality}
-else:
-    payload["output"]["quality"] = quality
-
-headers = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-    "Accept": "application/json",
-    "Origin": "https://loader.to",
-    "Referer": "https://loader.to/"
-}
-
-s = requests.Session()
-s.headers.update(headers)
-s.get("https://loader.to/", timeout=15)
-
-resp = s.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
-resp.raise_for_status()
-data = resp.json()
-status_url = data.get('statusUrl')
-title = data.get('title', 'video')
-
-dl_url = None
-for _ in range(120):
-    time.sleep(2)
-    try:
-        r = s.get(status_url, timeout=20)
-        status = r.json()
-        if status.get('status') == 'completed':
-            dl_url = status.get('downloadUrl')
-            break
-        if status.get('status') == 'failed':
-            sys.exit(1)
-    except:
-        continue
-
-if not dl_url:
-    sys.exit(1)
-
-vid_match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', url)
-vid = vid_match.group(1) if vid_match else "video"
-safe_title = re.sub(r'[^a-zA-Z0-9_-]', '_', title)[:70]
-filename = f"{safe_title}_{vid}_{quality}.{'mp3' if is_audio else 'mp4'}"
-
-r = requests.get(dl_url, stream=True)
-with open(f"{os.environ['OUTPUT_FOLDER']}/{filename}", 'wb') as f:
-    for chunk in r.iter_content(chunk_size=8192):
-        f.write(chunk)
-
-print(f"Downloaded: {filename}")
-EOF
-
-            if [ $? -ne 0 ]; then
-              echo "❌ loader.to failed for $link"
-              exit 1
-            fi
-          done
-        env:
-          OUTPUT_FOLDER: youtube
+          python3 download.py
 
       - name: Verify, split, rename
         run: |
