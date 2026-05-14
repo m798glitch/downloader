@@ -107,18 +107,6 @@ jobs:
         with:
           persist-credentials: true
 
-      # ── Cookies (secret only) ──
-      - name: '🍪 Prepare cookies'
-        run: |
-          if [ -n "$YOUTUBE_COOKIES" ]; then
-            echo "$YOUTUBE_COOKIES" > youtube-cookies.txt
-            echo "✅ YouTube cookies written from secret."
-          else
-            echo "ℹ️ No YOUTUBE_COOKIES secret – proceeding without cookies."
-          fi
-        env:
-          YOUTUBE_COOKIES: ${{ secrets.YOUTUBE_COOKIES }}
-
       # ── Parse URLs & per‑URL arguments ──
       - name: '📝 Parse all URLs and per‑URL arguments'
         id: parse
@@ -157,92 +145,31 @@ jobs:
           echo "IS_ANY_YT=$IS_ANY_YT" >> $GITHUB_OUTPUT
           echo "✅ Parsed $(echo "$ENTRIES" | jq length) entries, any YouTube? $IS_ANY_YT"
 
-      # ── Prepare PATH ──
-      - name: '📁 Prepare tool paths'
+      # ── Install minimal dependencies ──
+      - name: '🛠️ Install dependencies'
         if: steps.parse.outputs.IS_ANY_YT == 'true'
         run: |
-          mkdir -p ~/.local/bin
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-          echo "$HOME/.deno/bin" >> $GITHUB_PATH
-          echo "✅ Tool paths prepared."
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq python3-pip
+          pip3 install --quiet requests
+          echo "✅ jq and Python requests installed."
 
-      # ── Install tools ──
-      - name: '🛠️ Install download tools'
+      # ── Download via loader.to ──
+      - name: '⬇️ Download via loader.to'
         if: steps.parse.outputs.IS_ANY_YT == 'true'
-        run: |
-          echo "📥 Installing / updating yt-dlp..."
-          if ! command -v yt-dlp &> /dev/null; then
-            curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o ~/.local/bin/yt-dlp
-            chmod a+rx ~/.local/bin/yt-dlp
-          fi
-          echo "✅ yt-dlp ready."
-
-          echo "📥 Installing jq, ffmpeg..."
-          if ! command -v jq &> /dev/null || ! command -v ffmpeg &> /dev/null; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq jq ffmpeg
-          fi
-          echo "✅ jq & ffmpeg ready."
-
-          echo "📥 Installing Deno..."
-          if ! command -v deno &> /dev/null; then
-            curl -fsSL https://deno.land/install.sh | sh -s -- -y
-          fi
-          echo "✅ Deno ready."
-
-          echo "📥 Installing additional fallback dependencies..."
-          sudo apt-get install -y -qq python3-pip
-          pip3 install --quiet pytube youtube-dl requests
-          sudo curl -L https://yt-dl.org/downloads/latest/youtube-dl -o /usr/local/bin/youtube-dl
-          sudo chmod a+rx /usr/local/bin/youtube-dl
-          echo "✅ Fallback tools installed."
-
-          echo "🔑 Installing PO Token provider plugin..."
-          pip3 install -q -U "yt-dlp[default]" bgutil-ytdlp-pot-provider
-          echo "✅ PO Token provider plugin installed."
-
-      # ── Build & Start PO Token Server ──
-      - name: '🔧 Build PO Token server'
-        if: steps.parse.outputs.IS_ANY_YT == 'true'
-        run: |
-          echo "📥 Cloning bgutil-ytdlp-pot-provider server..."
-          git clone --depth 1 --branch 1.3.1 \
-            https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git \
-            /tmp/bgutil
-          cd /tmp/bgutil/server
-          echo "📦 Installing server dependencies..."
-          npm ci
-          npx tsc
-          echo "✅ PO Token server built."
-
-      - name: '🚀 Start PO Token server'
-        if: steps.parse.outputs.IS_ANY_YT == 'true'
-        run: |
-          echo "🚀 Starting PO Token provider server on port 4416..."
-          node /tmp/bgutil/server/build/main.js &
-          sleep 5
-          if pgrep -f "main.js" > /dev/null; then
-            echo "✅ PO Token server is running."
-          else
-            echo "⚠️ PO Token server may not have started. Continuing without it."
-          fi
-
-      # ── Primary download (original approach: yt-dlp -j → pick format ID) ──
-      - name: '⬇️ Primary download'
-        id: primary_download
         run: |
           set -e
           ENTRIES_JSON='${{ steps.parse.outputs.ENTRIES_JSON }}'
           OUTPUT_FOLDER="youtube"
           mkdir -p "$OUTPUT_FOLDER"
-          # Global defaults from the workflow inputs
+
+          # Global defaults from workflow inputs
           GLOBAL_FORMAT="${{ github.event.inputs.output_format }}"
           GLOBAL_VQ="${{ github.event.inputs.video_quality }}"
           GLOBAL_AQ="${{ github.event.inputs.audio_quality }}"
-          # Extract numeric part
           GLOBAL_VQ_NUM=$(echo "$GLOBAL_VQ" | grep -o '[0-9]*' | head -1)
           GLOBAL_AQ_NUM=$(echo "$GLOBAL_AQ" | grep -o '[0-9]*' | head -1)
-          # Derive the default type/value
+
           if [ "$GLOBAL_FORMAT" = "mp3 (audio only)" ]; then
             GLOBAL_TYPE="a"
             GLOBAL_VAL="$GLOBAL_AQ_NUM"
@@ -251,460 +178,117 @@ jobs:
             GLOBAL_VAL="$GLOBAL_VQ_NUM"
           fi
           echo "🔧 Global defaults: type=$GLOBAL_TYPE quality=$GLOBAL_VAL"
-          COOKIE_ARGS=""
-          [ -f youtube-cookies.txt ] && COOKIE_ARGS="--cookies youtube-cookies.txt"
-          # Force yt-dlp to see the original audio track
-          EXTRACTOR_ARGS="--extractor-args youtube:player_client=default,web_embedded"
-          FAILED_ENTRIES='[]'
-          count=$(echo "$ENTRIES_JSON" | jq length)
-          for ((idx=0; idx<count; idx++)); do
-            link=$(echo "$ENTRIES_JSON" | jq -r ".[$idx].link")
-            args=$(echo "$ENTRIES_JSON" | jq -r ".[$idx].args[]" 2>/dev/null || true)
-            type=""
-            val=""
-            if [ -n "$args" ]; then
-              first=$(echo "$args" | head -1)
-              if [ "$first" = "v" ] || [ "$first" = "a" ]; then
-                type="$first"
-                val=$(echo "$args" | head -2 | tail -1)
-              fi
-            fi
-            if [ -z "$type" ]; then
-              type="$GLOBAL_TYPE"
-              val="$GLOBAL_VAL"
-            fi
-            echo "========================================"
-            echo "🎬 Processing $((idx+1))/$count: $link"
-            echo "   🏷️  Type: $type   Quality: $val"
-            if [ "$type" = "a" ]; then
-              echo "   🎵 Downloading audio (format: ba[format_note*=original]/ba)"
-              if yt-dlp $COOKIE_ARGS $EXTRACTOR_ARGS \
-                -f "ba[format_note*=original]/ba" \
-                --js-runtimes deno --remote-components ejs:npm --no-progress \
-                -o "$OUTPUT_FOLDER/%(title)s-${val}kbps.%(ext)s" "$link"; then
-                echo "   ✅ Audio download success"
-              else
-                echo "   ❌ Primary download failed – queued for fallback"
-                FAILED_ENTRIES=$(echo "$FAILED_ENTRIES" | jq ". + [{link: \"$link\", type: \"$type\", val: \"$val\"}]")
-              fi
-            else
-              echo "   📹 Downloading video (format: bv[height<=$val]+(ba[format_note*=original]/ba))"
-              if yt-dlp $COOKIE_ARGS $EXTRACTOR_ARGS \
-                -f "bv[height<=$val]+(ba[format_note*=original]/ba)" \
-                --js-runtimes deno --remote-components ejs:npm --no-progress \
-                -o "$OUTPUT_FOLDER/%(title)s-${val}p.%(ext)s" "$link"; then
-                echo "   ✅ Video download success"
-              else
-                echo "   ❌ Primary download failed – queued for fallback"
-                FAILED_ENTRIES=$(echo "$FAILED_ENTRIES" | jq ". + [{link: \"$link\", type: \"$type\", val: \"$val\"}]")
-              fi
-            fi
-          done
-          FAILED_ENTRIES_JSON=$(echo "$FAILED_ENTRIES" | jq -c .)
-          echo "FAILED_ENTRIES_JSON=$FAILED_ENTRIES_JSON" >> $GITHUB_OUTPUT
-          echo "📊 Primary phase done. Failures: $(echo "$FAILED_ENTRIES" | jq length)"
 
-      # ── Fallback pipelines (4 strategies: PO Token → IPv4 → ytmp3.gg → Advanced) ──
-      - name: '🔄 Fallback pipelines'
-        if: steps.primary_download.outputs.FAILED_ENTRIES_JSON != '[]'
-        run: |
-          set -e
-          FAILED_ENTRIES='${{ steps.primary_download.outputs.FAILED_ENTRIES_JSON }}'
-          count=$(echo "$FAILED_ENTRIES" | jq length)
-          echo "🔄 Attempting fallback for $count failed entries..."
-          OUTPUT_FOLDER="youtube"
+          # Run the download script (inline Python)
+          python3 -u << 'PYEOF' "$ENTRIES_JSON" "$GLOBAL_TYPE" "$GLOBAL_VAL" "$OUTPUT_FOLDER"
+import os, sys, json, re, requests, time
 
-          # Helper for filename suffix
-          build_suffix() {
-            local type="$1"
-            local val="$2"
-            if [ "$type" = "a" ]; then
-              echo "${val}kbps"
-            else
-              echo "${val}p"
-            fi
-          }
+entries_json = sys.argv[1]
+global_type = sys.argv[2]
+global_quality = sys.argv[3]
+output_dir = sys.argv[4]
 
-          # ── Fallback 0: Piped privacy-respecting API (dynamic instance list) ──
-          fallback_piped() {
-            echo "[fallback] Piped API"
-            local url="$1"
-            local type="$2"
-            local val="$3"
-          
-            # ── 1. Extract video ID ──
-            local vid
-            vid=$(echo "$url" | sed -n 's/.*v=\([a-zA-Z0-9_-]\{11\}\).*/\1/p' | head -1)
-            if [ -z "$vid" ]; then
-              echo "❌ Piped: could not extract video ID from $url"
-              return 1
-            fi
-            echo "   🔑 Video ID: $vid"
-          
-            # ── 2. Collect instances: first try fast cached list, then fetch official list ──
-            local instances=()
-          
-            # Phase 1: cached fast mirrors (often low latency)
-            local cached=(
-              "https://pipedapi.kavin.rocks"
-              "https://pipedapi-libre.kavin.rocks"
-              "https://pipedapi.adminforge.de"
-              "https://pipedapi.syncpundit.com"
-            )
-            instances+=("${cached[@]}")
-          
-            # Phase 2: try to fetch official dynamic list from GitHub
-            echo "   📡 Fetching official Piped public instance list..."
-            local official_json
-            official_json=$(curl -s --max-time 10 "https://raw.githubusercontent.com/TeamPiped/Piped/master/public_instances.json" 2>/dev/null)
-            if [ -n "$official_json" ]; then
-              # Extract all api_urls where api: true
-              mapfile -t extra < <(echo "$official_json" | jq -r '.[] | select(.api == true) | .api_url // empty')
-              for e in "${extra[@]}"; do
-                # Avoid duplicates from cached list
-                if [[ ! " ${instances[*]} " =~ " ${e} " ]]; then
-                  instances+=("$e")
-                fi
-              done
-              echo "   ✅ Loaded ${#instances[@]} total unique instances."
-            else
-              echo "   ⚠️  Could not fetch official list; using only cached instances."
-            fi
-          
-            # ── 3. Try each instance until one works ──
-            local info=""
-            local api_base=""
-            for inst in "${instances[@]}"; do
-              echo "   🌐 Trying instance: $inst"
-              info=$(curl -s --max-time 15 "${inst}/streams/${vid}" 2>/dev/null)
-              # Check that the response contains a non-empty videoStreams array
-              if echo "$info" | jq -e '.videoStreams | length > 0' >/dev/null 2>&1; then
-                api_base="$inst"
-                echo "   ✅ Instance $inst responded with valid stream data"
-                break
-              else
-                echo "   ⚠️  Instance $inst failed: $(echo "$info" | jq -c '{title, error}' 2>/dev/null || echo 'invalid JSON')"
-              fi
-            done
-          
-            if [ -z "$api_base" ]; then
-              echo "❌ Piped: all instances failed"
-              return 1
-            fi
-          
-            # ── 4. Extract title and sanitise it ──
-            local title
-            title=$(echo "$info" | jq -r '.title // "video"')
-            local safe_title
-            safe_title=$(echo "$title" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__*/_/g' | head -c 100)
-            local suffix
-            if [ "$type" = "a" ]; then
-              suffix="${val}kbps"
-            else
-              suffix="${val}p"
-            fi
-          
-            # ── 5. Choose streams based on type ──
-            if [ "$type" = "a" ]; then
-              # Audio-only
-              echo "   🎵 Audio-only mode – selecting best audio stream"
-              local audio_url
-              audio_url=$(echo "$info" | jq -r '.audioStreams | sort_by(-.bitrate) | .[0].url // ""')
-              if [ -z "$audio_url" ] || [ "$audio_url" = "null" ]; then
-                echo "❌ Piped: no audio stream found"
-                return 1
-              fi
-              local filename="${safe_title}-${suffix}.m4a"
-              echo "   🌐 Downloading audio: $filename"
-              curl -L --fail --progress-bar --retry 3 --retry-delay 5 \
-                   -o "${OUTPUT_FOLDER}/${filename}" "$audio_url"
-              if [ ! -s "${OUTPUT_FOLDER}/${filename}" ]; then
-                echo "❌ Piped: audio download empty"
-                return 1
-              fi
-              echo "   ✅ Piped audio success"
-          
-            else
-              # Video
-              echo "   📹 Video mode – target height ≤ ${val}p"
-          
-              local video_url video_height
-              video_url=$(echo "$info" | jq -r --argjson maxh "$val" \
-                '.videoStreams | map(select(.videoOnly == true and .height <= $maxh)) | sort_by(-.height) | .[0].url // ""')
-              video_height=$(echo "$info" | jq -r --argjson maxh "$val" \
-                '.videoStreams | map(select(.videoOnly == true and .height <= $maxh)) | sort_by(-.height) | .[0].height // 0')
-          
-              if [ -z "$video_url" ] || [ "$video_url" = "null" ]; then
-                echo "   ⚠️  No video-only stream ≤ ${val}p; falling back to any video stream"
-                video_url=$(echo "$info" | jq -r --argjson maxh "$val" \
-                  '.videoStreams | map(select(.height <= $maxh)) | sort_by(-.height) | .[0].url // ""')
-                video_height=$(echo "$info" | jq -r --argjson maxh "$val" \
-                  '.videoStreams | map(select(.height <= $maxh)) | sort_by(-.height) | .[0].height // 0')
-              fi
-          
-              local audio_url
-              audio_url=$(echo "$info" | jq -r '.audioStreams | sort_by(-.bitrate) | .[0].url // ""')
-          
-              if [ -z "$video_url" ] || [ "$video_url" = "null" ]; then
-                echo "❌ Piped: no suitable video stream found"
-                return 1
-              fi
-              if [ -z "$audio_url" ] || [ "$audio_url" = "null" ]; then
-                echo "❌ Piped: no audio stream found"
-                return 1
-              fi
-          
-              echo "   📐 Selected video: ${video_height}p"
-              local filename="${safe_title}-${suffix}.mp4"
-              local tmp_video="${OUTPUT_FOLDER}/.tmp_${vid}_video"
-              local tmp_audio="${OUTPUT_FOLDER}/.tmp_${vid}_audio"
-          
-              echo "   ⬇️  Downloading video stream..."
-              curl -L --fail --progress-bar --retry 3 --retry-delay 5 \
-                   -o "$tmp_video" "$video_url" || { echo "❌ Video download failed"; return 1; }
-          
-              echo "   ⬇️  Downloading audio stream..."
-              curl -L --fail --progress-bar --retry 3 --retry-delay 5 \
-                   -o "$tmp_audio" "$audio_url" || { echo "❌ Audio download failed"; rm -f "$tmp_video"; return 1; }
-          
-              echo "   🔧 Muxing with ffmpeg..."
-              ffmpeg -y -v quiet -i "$tmp_video" -i "$tmp_audio" -c copy "${OUTPUT_FOLDER}/${filename}" 2>/dev/null
-              local mux_ok=$?
-              rm -f "$tmp_video" "$tmp_audio"
-          
-              if [ $mux_ok -ne 0 ] || [ ! -s "${OUTPUT_FOLDER}/${filename}" ]; then
-                echo "❌ Piped: ffmpeg mux failed"
-                return 1
-              fi
-              echo "   ✅ Piped video success"
-            fi
-          }
+entries = json.loads(entries_json)
+total = len(entries)
 
-          # ── Fallback 1: yt-dlp with PO Token provider (new) ──
-          fallback_po_token() {
-            echo "[fallback] yt-dlp with PO Token + multi-client"
-            local suf=$(build_suffix "$2" "$3")
-            local fmt
-            if [ "$2" = "a" ]; then
-              fmt="ba[format_note*=original]/ba"
-            else
-              fmt="bv[height<=$3]+(ba[format_note*=original]/ba)"
-            fi
-            yt-dlp \
-              --extractor-args "youtube:player_client=web_music,web,tv" \
-              --js-runtimes deno --newline --concurrent-fragments 4 \
-              $COOKIE_ARGS \
-              -f "$fmt" \
-              -o "$OUTPUT_FOLDER/%(title)s-${suf}.%(ext)s" "$1"
-          }
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Origin": "https://loader.to",
+    "Referer": "https://loader.to/",
+})
 
-          # ── Fallback 2: yt-dlp with forced IPv4 + retries ──
-          fallback_force_ipv4() {
-            echo "[fallback] yt-dlp forced IPv4 + retries"
-            local suf=$(build_suffix "$2" "$3")
-            local fmt
-            if [ "$2" = "a" ]; then
-              fmt="ba[format_note*=original]/ba"
-            else
-              fmt="bv[height<=$3]+(ba[format_note*=original]/ba)"
-            fi
-            yt-dlp --force-ipv4 --retries 10 --fragment-retries 10 \
-              --cookies youtube-cookies.txt \
-              --extractor-args "youtube:player_client=default,web_embedded" \
-              -f "$fmt" \
-              --js-runtimes deno --remote-components ejs:npm --no-progress \
-              -o "$OUTPUT_FOLDER/%(title)s-${suf}.%(ext)s" "$1"
-          }
+def download_one(link, dl_type, quality):
+    # Map to loader.to parameters
+    if dl_type == 'a':
+        fmt = 'mp3'
+        qual_str = f'{quality}kbps'
+    else:
+        fmt = 'mp4'
+        qual_str = f'{quality}p'
 
-          # ── Fallback 3: ytmp3.gg API (enhanced + all qualities) ──
-          fallback_ytmp3_api() {
-            echo "[fallback] ytmp3.gg API"
-            local type="$2"
-            local val="$3"
-            FORMAT="mp4"
-            QUALITY="720p"
-            if [ "$type" = "a" ]; then
-              FORMAT="mp3"
-              QUALITY="${val:-192}kbps"
-            else
-              QUALITY="${val:-720}p"
-            fi
-          
-            # Atomic temporary file
-            local tmp_info
-            tmp_info=$(mktemp)
-            export TMP_INFO="$tmp_info"
-          
-            # Inline Python using shell: python (YAML-safe)
-            python -u << 'PYEOF'
-          import os, sys, time, re, requests, json
-          URL = os.environ.get('FB_URL')
-          FMT = os.environ.get('FB_FMT')
-          QUAL = os.environ.get('FB_QUAL')
-          TMP_INFO = os.environ.get('TMP_INFO')
-          is_audio = FMT == 'mp3'
-          
-          # Quality normalization – now supports all common YouTube resolutions
-          VALID_VIDEO_QUAL = ('360p','480p','720p','1080p','1440p','2160p')
-          VALID_AUDIO_QUAL = ('64kbps','128kbps','192kbps','320kbps')
-          
-          if is_audio:
-              QUAL = QUAL if QUAL in VALID_AUDIO_QUAL else '192kbps'
-          else:
-              QUAL = QUAL if QUAL in VALID_VIDEO_QUAL else '720p'
-          
-          # Build payload mimicking a browser client
-          payload = {
-              "url": URL,
-              "os": "linux",
-              "output": {
-                  "type": "audio" if is_audio else "video",
-                  "format": FMT
-              }
-          }
-          if is_audio:
-              payload["audio"] = {"bitrate": QUAL}
-          else:
-              payload["output"]["quality"] = QUAL
-          
-          # Session with browser-like headers (bot evasion)
-          s = requests.Session()
-          s.headers.update({
-              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-              "Accept": "application/json, text/plain, */*",
-              "Accept-Language": "en-US,en;q=0.9",
-              "Origin": "https://ytmp3.gg",
-              "Referer": "https://ytmp3.gg/",
-              "Sec-Fetch-Dest": "empty",
-              "Sec-Fetch-Mode": "cors",
-              "Sec-Fetch-Site": "same-site"
-          })
-          
-          # Init session with a GET to the main site
-          try:
-              s.get("https://ytmp3.gg/", timeout=15)
-          except Exception:
-              pass
-          
-          # Submit conversion request
-          try:
-              resp = s.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
-              resp.raise_for_status()
-          except requests.exceptions.HTTPError as e:
-              print(f"::error::ytmp3.gg API rejected: {e}")
-              sys.exit(1)
-          
-          data = resp.json()
-          status_url = data.get('statusUrl')
-          title = data.get('title', 'video')
-          dl_url = None
-          
-          # Poll for completion (up to 5 minutes)
-          for _ in range(150):
-              time.sleep(2)
-              try:
-                  r = s.get(status_url, timeout=20)
-                  status = r.json()
-                  if status.get('status') == 'completed':
-                      dl_url = status.get('downloadUrl')
-                      break
-                  if status.get('status') == 'failed':
-                      print("::error::Server failed to prepare the video")
-                      sys.exit(1)
-              except Exception:
-                  continue
-          
-          if not dl_url:
-              print("::error::Could not get download link after 5 minutes")
-              sys.exit(1)
-          
-          # Sanitize filename
-          vid = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', URL)[1]
-          clean = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
-          clean = re.sub(r'_+', '_', clean).strip('_')[:70] or vid
-          fname = f"{clean}_{vid}_{QUAL}.{FMT}"
-          
-          # Atomic write
-          with open(TMP_INFO, "w", encoding="utf-8") as f:
-              json.dump({"url": dl_url, "filename": fname, "title": title}, f)
-          print(f"::notice::ytmp3.gg prepared: {fname}")
-          PYEOF
-          
-            # Read from the atomic temp file
-            if [ ! -s "$tmp_info" ]; then
-              echo "❌ ytmp3.gg: no download info written"
-              rm -f "$tmp_info"
-              return 1
-            fi
-          
-            DL_URL=$(python3 -c "import json; print(json.load(open('$tmp_info'))['url'])")
-            FILENAME=$(python3 -c "import json; print(json.load(open('$tmp_info'))['filename'])")
-          
-            echo "   🌐 Downloading via ytmp3.gg: $FILENAME"
-            curl -L --fail --progress-bar --retry 3 --retry-delay 5 \
-                 -o "$OUTPUT_FOLDER/$FILENAME" "$DL_URL"
-          
-            rm -f "$tmp_info"
-          
-            if [ ! -s "$OUTPUT_FOLDER/$FILENAME" ]; then
-              echo "❌ ytmp3.gg download empty"
-              return 1
-            fi
-            echo "   ✅ ytmp3.gg success"
-          }
+    # Make a GET to loader.to homepage (helps with any CSRF/state)
+    try:
+        session.get("https://loader.to/", timeout=10)
+    except:
+        pass
 
-          # ── Fallback 4: Advanced yt-dlp (multi-client) ──
-          fallback_ytdlp_advanced() {
-            echo "[fallback] yt-dlp advanced (web_music+tv+web)"
-            local suf=$(build_suffix "$2" "$3")
-            local fmt
-            if [ "$2" = "a" ]; then
-              fmt="ba[format_note*=original]/ba"
-            else
-              fmt="bv[height<=$3]+(ba[format_note*=original]/ba)"
-            fi
-            yt-dlp \
-              --extractor-args "youtube:player_client=web_music,web,tv,web_embedded" \
-              -f "$fmt" \
-              --js-runtimes deno --newline --concurrent-fragments 4 \
-              $COOKIE_ARGS \
-              -o "$OUTPUT_FOLDER/%(title)s-${suf}.%(ext)s" "$1"
-          }
+    payload = {
+        "url": link,
+        "format": fmt,
+        "quality": qual_str,
+    }
 
-          FALLBACKS=(
-            fallback_piped
-            fallback_po_token
-            fallback_force_ipv4
-            fallback_ytmp3_api
-            fallback_ytdlp_advanced
-          )
+    try:
+        resp = session.post(
+            "https://loader.to/ajax/download.php",
+            data=payload,
+            timeout=30
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"   ❌ Loader.to request failed: {e}")
+        return False
 
-          # ── Run fallbacks ──
-          for ((idx=0; idx<count; idx++)); do
-            link=$(echo "$FAILED_ENTRIES" | jq -r ".[$idx].link")
-            type=$(echo "$FAILED_ENTRIES" | jq -r ".[$idx].type")
-            val=$(echo "$FAILED_ENTRIES" | jq -r ".[$idx].val")
-            echo "========================================"
-            echo "🔄 Fallback for: $link ($type $val)"
-            succeeded=false
-            for fb in "${FALLBACKS[@]}"; do
-              export FB_URL="$link"
-              export FB_FMT="$([ "$type" = "a" ] && echo "mp3" || echo "mp4")"
-              export FB_QUAL="$val"
-              if $fb "$link" "$type" "$val"; then
-                echo "   ✅ Fallback '$fb' succeeded"
-                succeeded=true
-                break
-              else
-                echo "   ❌ Fallback '$fb' failed"
-              fi
-            done
-            if [ "$succeeded" = false ]; then
-              echo "❌ All fallbacks exhausted for $link"
-            fi
-          done
-        env:
-          COOKIE_ARGS: ${{ (secrets.YOUTUBE_COOKIES && '--cookies youtube-cookies.txt') || '' }}
+    if not data.get("success"):
+        print(f"   ❌ Loader.to error: {data.get('msg', 'unknown')}")
+        return False
+
+    download_url = data.get("download_url") or data.get("link")
+    if not download_url:
+        print("   ❌ No download URL returned")
+        return False
+
+    # Extract video ID for filename
+    match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', link)
+    vid = match[1] if match else 'video'
+
+    # Build a safe filename
+    title = data.get('title', 'video')
+    safe_title = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
+    safe_title = re.sub(r'_+', '_', safe_title).strip('_')[:70] or vid
+    suffix = f'{quality}kbps' if dl_type == 'a' else f'{quality}p'
+    filename = f"{safe_title}_{vid}_{suffix}.{fmt}"
+
+    filepath = os.path.join(output_dir, filename)
+    print(f"   ⬇️  Downloading: {filename}")
+    dl_resp = session.get(download_url, stream=True, timeout=300)
+    dl_resp.raise_for_status()
+    with open(filepath, 'wb') as f:
+        for chunk in dl_resp.iter_content(chunk_size=8192):
+            f.write(chunk)
+
+    if os.path.getsize(filepath) == 0:
+        print("   ❌ Downloaded file is empty")
+        os.remove(filepath)
+        return False
+    print(f"   ✅ Saved: {filename}")
+    return True
+
+for idx, entry in enumerate(entries):
+    link = entry["link"]
+    args = entry.get("args", [])
+
+    # Determine per-URL type/quality
+    dl_type = global_type
+    quality = global_quality
+    if args and len(args) >= 2 and args[0] in ("v", "a"):
+        dl_type = args[0]
+        quality = args[1]
+
+    print("=" * 40)
+    print(f"🎬 [{idx+1}/{total}] {link}")
+    print(f"   🏷️  Type: {dl_type}   Quality: {quality}")
+
+    success = download_one(link, dl_type, quality)
+    if not success:
+        print("   ⚠️  Skipping due to loader.to failure")
+
+PYEOF
+
+          echo "📊 loader.to processing completed."
 
       # ── Verify & Rename Downloads ──
       - name: '🗂️ Verify & Rename Downloads'
@@ -715,7 +299,6 @@ jobs:
           THRESH_MB=99
           THRESH_BYTES=$((THRESH_MB * 1024 * 1024))
 
-          # 1. Ensure the output folder exists & is not empty
           if [ ! -d "$OUTPUT_FOLDER" ] || [ -z "$(ls -A "$OUTPUT_FOLDER" 2>/dev/null)" ]; then
             echo "❌ ERROR: '$OUTPUT_FOLDER' folder is missing or empty – nothing to commit."
             exit 1
@@ -724,7 +307,7 @@ jobs:
           echo "📂 Initial contents of '$OUTPUT_FOLDER':"
           ls -lah "$OUTPUT_FOLDER"
 
-          # 2. Split files >99 MB into .zip parts
+          # Split files >99 MB into .zip parts
           echo "🔍 Checking files in '$OUTPUT_FOLDER' for >${THRESH_MB}MB..."
           for f in "$OUTPUT_FOLDER"/*; do
             [ -f "$f" ] || continue
@@ -737,7 +320,7 @@ jobs:
             fi
           done
 
-          # 3. Rename files to a consistent pattern
+          # Rename files to a consistent pattern
           for f in "$OUTPUT_FOLDER"/*; do
             [ -f "$f" ] || continue
             dir=$(dirname "$f")
@@ -770,21 +353,17 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config http.postBuffer 524288000
 
-          # Stage only the output folder explicitly
           git add "$OUTPUT_FOLDER/"
 
-          # Check that something was actually staged
           if git diff --cached --quiet; then
             echo "⚠️  No changes staged – nothing to commit."
             exit 1
           fi
 
-          # Show what will be committed (useful for debugging)
           git diff --cached --stat
 
           git commit -m "⬇️ YouTube download [skip ci]"
 
-          # Push with retry logic
           RETRIES=5
           for i in $(seq 1 $RETRIES); do
             echo "🚀 Push attempt $i..."
@@ -807,7 +386,5 @@ jobs:
       - name: '🧹 Cleanup'
         if: always()
         run: |
-          rm -rf .download_info youtube-cookies.txt 2>/dev/null || true
-          # Kill PO Token server if running
-          pkill -f "main.js" 2>/dev/null || true
+          rm -rf youtube-cookies.txt 2>/dev/null || true
           echo "✅ Cleanup done."
