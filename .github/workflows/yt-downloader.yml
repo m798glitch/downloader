@@ -107,7 +107,6 @@ jobs:
         with:
           persist-credentials: true
 
-      # ── Parse URLs & per‑URL arguments ──
       - name: '📝 Parse all URLs and per‑URL arguments'
         id: parse
         run: |
@@ -145,7 +144,6 @@ jobs:
           echo "IS_ANY_YT=$IS_ANY_YT" >> $GITHUB_OUTPUT
           echo "✅ Parsed $(echo "$ENTRIES" | jq length) entries, any YouTube? $IS_ANY_YT"
 
-      # ── Install minimal dependencies ──
       - name: '🛠️ Install dependencies'
         if: steps.parse.outputs.IS_ANY_YT == 'true'
         run: |
@@ -154,16 +152,123 @@ jobs:
           pip3 install --quiet requests
           echo "✅ jq and Python requests installed."
 
-      # ── Download via loader.to ──
+      - name: '🐍 Create Python downloader script'
+        if: steps.parse.outputs.IS_ANY_YT == 'true'
+        run: |
+          cat <<- 'PYEOF' > downloader.py
+          →import os, sys, json, re, requests, time
+          →
+          →entries_json = sys.argv[1]
+          →global_type = sys.argv[2]
+          →global_quality = sys.argv[3]
+          →output_dir = sys.argv[4]
+          →
+          →entries = json.loads(entries_json)
+          →total = len(entries)
+          →
+          →session = requests.Session()
+          →session.headers.update({
+          →    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+          →    "Accept": "application/json, text/plain, */*",
+          →    "Origin": "https://loader.to",
+          →    "Referer": "https://loader.to/",
+          →})
+          →
+          →def download_one(link, dl_type, quality):
+          →    # Map to loader.to parameters
+          →    if dl_type == 'a':
+          →        fmt = 'mp3'
+          →        qual_str = f'{quality}kbps'
+          →    else:
+          →        fmt = 'mp4'
+          →        qual_str = f'{quality}p'
+          →
+          →    # Make a GET to loader.to homepage (helps with any CSRF/state)
+          →    try:
+          →        session.get("https://loader.to/", timeout=10)
+          →    except:
+          →        pass
+          →
+          →    payload = {
+          →        "url": link,
+          →        "format": fmt,
+          →        "quality": qual_str,
+          →    }
+          →
+          →    try:
+          →        resp = session.post(
+          →            "https://loader.to/ajax/download.php",
+          →            data=payload,
+          →            timeout=30
+          →        )
+          →        resp.raise_for_status()
+          →        data = resp.json()
+          →    except Exception as e:
+          →        print(f"   ❌ Loader.to request failed: {e}")
+          →        return False
+          →
+          →    if not data.get("success"):
+          →        print(f"   ❌ Loader.to error: {data.get('msg', 'unknown')}")
+          →        return False
+          →
+          →    download_url = data.get("download_url") or data.get("link")
+          →    if not download_url:
+          →        print("   ❌ No download URL returned")
+          →        return False
+          →
+          →    # Extract video ID for filename
+          →    match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', link)
+          →    vid = match[1] if match else 'video'
+          →
+          →    # Build a safe filename
+          →    title = data.get('title', 'video')
+          →    safe_title = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
+          →    safe_title = re.sub(r'_+', '_', safe_title).strip('_')[:70] or vid
+          →    suffix = f'{quality}kbps' if dl_type == 'a' else f'{quality}p'
+          →    filename = f"{safe_title}_{vid}_{suffix}.{fmt}"
+          →
+          →    filepath = os.path.join(output_dir, filename)
+          →    print(f"   ⬇️  Downloading: {filename}")
+          →    dl_resp = session.get(download_url, stream=True, timeout=300)
+          →    dl_resp.raise_for_status()
+          →    with open(filepath, 'wb') as f:
+          →        for chunk in dl_resp.iter_content(chunk_size=8192):
+          →            f.write(chunk)
+          →
+          →    if os.path.getsize(filepath) == 0:
+          →        print("   ❌ Downloaded file is empty")
+          →        os.remove(filepath)
+          →        return False
+          →    print(f"   ✅ Saved: {filename}")
+          →    return True
+          →
+          →for idx, entry in enumerate(entries):
+          →    link = entry["link"]
+          →    args = entry.get("args", [])
+          →
+          →    dl_type = global_type
+          →    quality = global_quality
+          →    if args and len(args) >= 2 and args[0] in ("v", "a"):
+          →        dl_type = args[0]
+          →        quality = args[1]
+          →
+          →    print("=" * 40)
+          →    print(f"🎬 [{idx+1}/{total}] {link}")
+          →    print(f"   🏷️  Type: {dl_type}   Quality: {quality}")
+          →
+          →    success = download_one(link, dl_type, quality)
+          →    if not success:
+          →        print("   ⚠️  Skipping due to loader.to failure")
+          PYEOF
+          echo "✅ downloader.py created."
+
       - name: '⬇️ Download via loader.to'
         if: steps.parse.outputs.IS_ANY_YT == 'true'
         run: |
           set -e
-          ENTRIES_JSON='${{ steps.parse.outputs.ENTRIES_JSON }}'
           OUTPUT_FOLDER="youtube"
           mkdir -p "$OUTPUT_FOLDER"
 
-          # Global defaults from workflow inputs
           GLOBAL_FORMAT="${{ github.event.inputs.output_format }}"
           GLOBAL_VQ="${{ github.event.inputs.video_quality }}"
           GLOBAL_AQ="${{ github.event.inputs.audio_quality }}"
@@ -177,120 +282,13 @@ jobs:
             GLOBAL_TYPE="v"
             GLOBAL_VAL="$GLOBAL_VQ_NUM"
           fi
+
           echo "🔧 Global defaults: type=$GLOBAL_TYPE quality=$GLOBAL_VAL"
-
-          # Run the download script (inline Python)
-          python3 -u << 'PYEOF' "$ENTRIES_JSON" "$GLOBAL_TYPE" "$GLOBAL_VAL" "$OUTPUT_FOLDER"
-import os, sys, json, re, requests, time
-
-entries_json = sys.argv[1]
-global_type = sys.argv[2]
-global_quality = sys.argv[3]
-output_dir = sys.argv[4]
-
-entries = json.loads(entries_json)
-total = len(entries)
-
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Origin": "https://loader.to",
-    "Referer": "https://loader.to/",
-})
-
-def download_one(link, dl_type, quality):
-    # Map to loader.to parameters
-    if dl_type == 'a':
-        fmt = 'mp3'
-        qual_str = f'{quality}kbps'
-    else:
-        fmt = 'mp4'
-        qual_str = f'{quality}p'
-
-    # Make a GET to loader.to homepage (helps with any CSRF/state)
-    try:
-        session.get("https://loader.to/", timeout=10)
-    except:
-        pass
-
-    payload = {
-        "url": link,
-        "format": fmt,
-        "quality": qual_str,
-    }
-
-    try:
-        resp = session.post(
-            "https://loader.to/ajax/download.php",
-            data=payload,
-            timeout=30
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        print(f"   ❌ Loader.to request failed: {e}")
-        return False
-
-    if not data.get("success"):
-        print(f"   ❌ Loader.to error: {data.get('msg', 'unknown')}")
-        return False
-
-    download_url = data.get("download_url") or data.get("link")
-    if not download_url:
-        print("   ❌ No download URL returned")
-        return False
-
-    # Extract video ID for filename
-    match = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', link)
-    vid = match[1] if match else 'video'
-
-    # Build a safe filename
-    title = data.get('title', 'video')
-    safe_title = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
-    safe_title = re.sub(r'_+', '_', safe_title).strip('_')[:70] or vid
-    suffix = f'{quality}kbps' if dl_type == 'a' else f'{quality}p'
-    filename = f"{safe_title}_{vid}_{suffix}.{fmt}"
-
-    filepath = os.path.join(output_dir, filename)
-    print(f"   ⬇️  Downloading: {filename}")
-    dl_resp = session.get(download_url, stream=True, timeout=300)
-    dl_resp.raise_for_status()
-    with open(filepath, 'wb') as f:
-        for chunk in dl_resp.iter_content(chunk_size=8192):
-            f.write(chunk)
-
-    if os.path.getsize(filepath) == 0:
-        print("   ❌ Downloaded file is empty")
-        os.remove(filepath)
-        return False
-    print(f"   ✅ Saved: {filename}")
-    return True
-
-for idx, entry in enumerate(entries):
-    link = entry["link"]
-    args = entry.get("args", [])
-
-    # Determine per-URL type/quality
-    dl_type = global_type
-    quality = global_quality
-    if args and len(args) >= 2 and args[0] in ("v", "a"):
-        dl_type = args[0]
-        quality = args[1]
-
-    print("=" * 40)
-    print(f"🎬 [{idx+1}/{total}] {link}")
-    print(f"   🏷️  Type: {dl_type}   Quality: {quality}")
-
-    success = download_one(link, dl_type, quality)
-    if not success:
-        print("   ⚠️  Skipping due to loader.to failure")
-
-PYEOF
-
+          python3 -u downloader.py \
+            '${{ steps.parse.outputs.ENTRIES_JSON }}' \
+            "$GLOBAL_TYPE" "$GLOBAL_VAL" "$OUTPUT_FOLDER"
           echo "📊 loader.to processing completed."
 
-      # ── Verify & Rename Downloads ──
       - name: '🗂️ Verify & Rename Downloads'
         id: verify
         run: |
@@ -307,7 +305,6 @@ PYEOF
           echo "📂 Initial contents of '$OUTPUT_FOLDER':"
           ls -lah "$OUTPUT_FOLDER"
 
-          # Split files >99 MB into .zip parts
           echo "🔍 Checking files in '$OUTPUT_FOLDER' for >${THRESH_MB}MB..."
           for f in "$OUTPUT_FOLDER"/*; do
             [ -f "$f" ] || continue
@@ -320,7 +317,6 @@ PYEOF
             fi
           done
 
-          # Rename files to a consistent pattern
           for f in "$OUTPUT_FOLDER"/*; do
             [ -f "$f" ] || continue
             dir=$(dirname "$f")
@@ -335,7 +331,6 @@ PYEOF
           echo "✅ Verification & processing complete."
           echo "::set-output name=file_count::$(ls -1 "$OUTPUT_FOLDER" | wc -l)"
 
-      # ── Atomic Commit & Push ──
       - name: '📤 Commit & Push Changes'
         run: |
           set -e
@@ -382,9 +377,8 @@ PYEOF
             fi
           done
 
-      # ── Cleanup ──
       - name: '🧹 Cleanup'
         if: always()
         run: |
-          rm -rf youtube-cookies.txt 2>/dev/null || true
+          rm -f downloader.py youtube-cookies.txt 2>/dev/null || true
           echo "✅ Cleanup done."
